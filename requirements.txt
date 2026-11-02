@@ -1,0 +1,13 @@
+Flask
+gunicorn
+joblib
+numpy
+pandas
+scipy
+scikit-learn
+pyarrow
+pypdf
+python-docx
+Pillow
+pytesseract
+pdf2image
