@@ -81,12 +81,27 @@ if not retrieval_path.exists():
         f"Required retrieval corpus is missing: {retrieval_path}. "
         "Ensure retrieval_corpus.parquet is in the artifacts folder."
     )
-retrieval = pd.read_parquet(retrieval_path)
+# Stream the Parquet file instead of loading the full corpus into pandas.
+# This reduces startup RAM usage on Render's 512 MiB instance.
+import pyarrow.parquet as pq
 
-if "model_text" not in retrieval.columns:
+retrieval_file = pq.ParquetFile(retrieval_path)
+retrieval_columns = set(retrieval_file.schema.names)
+
+if "model_text" not in retrieval_columns:
     raise ValueError("retrieval_corpus.parquet must contain a 'model_text' column.")
-if "y" not in retrieval.columns:
+if "y" not in retrieval_columns:
     raise ValueError("retrieval_corpus.parquet must contain a 'y' outcome column.")
+
+RETRIEVAL_BATCH_SIZE = 256
+RETRIEVAL_COLUMNS = [
+    column for column in ("model_text", "y", "district", "id")
+    if column in retrieval_columns
+]
+logger.info(
+    "Opened historical corpus (%s rows) for streamed retrieval",
+    retrieval_file.metadata.num_rows,
+)
 
 
 def clean(text):
@@ -97,14 +112,6 @@ def clean(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
-# Keep historical text in the dataframe, but do not vectorize the full corpus
-# during startup. The full sparse matrix can exceed Render's 512 MB RAM.
-RETRIEVAL_BATCH_SIZE = 256
-logger.info(
-    "Loaded %s historical cases; retrieval will run in batches of %s",
-    len(retrieval),
-    RETRIEVAL_BATCH_SIZE,
-)
 
 
 # -----------------------------------------------------------------------------
@@ -328,50 +335,50 @@ def predict_case(text):
     label = 1 if probability >= 0.5 else 0
     confidence = max(probability, 1.0 - probability)
 
-    # Exact cosine-similarity retrieval in bounded batches. This keeps the
-    # same TF-IDF representation and ranking method without holding the
-    # entire historical-corpus matrix in memory.
-    best_scores = np.empty(0, dtype=np.float32)
-    best_indices = np.empty(0, dtype=np.int64)
+    # Stream historical rows from Parquet in bounded batches. The full
+    # DataFrame and full-corpus TF-IDF matrix are never created in memory.
+    best_cases = []
 
-    for start in range(0, len(retrieval), RETRIEVAL_BATCH_SIZE):
-        end = min(start + RETRIEVAL_BATCH_SIZE, len(retrieval))
-        batch_text = (
-            retrieval["model_text"]
-            .iloc[start:end]
-            .fillna("")
-            .astype(str)
-            .map(clean)
-        )
+    for record_batch in retrieval_file.iter_batches(
+        batch_size=RETRIEVAL_BATCH_SIZE,
+        columns=RETRIEVAL_COLUMNS,
+    ):
+        batch = record_batch.to_pandas()
+        batch_text = batch["model_text"].fillna("").astype(str).map(clean)
+
         batch_vectors = hstack(
             [word.transform(batch_text), char.transform(batch_text)]
         ).tocsr()
-
-        batch_scores = cosine_similarity(x, batch_vectors).ravel().astype(np.float32)
-        batch_indices = np.arange(start, end, dtype=np.int64)
+        batch_scores = cosine_similarity(x, batch_vectors).ravel()
 
         if len(batch_scores):
-            combined_scores = np.concatenate((best_scores, batch_scores))
-            combined_indices = np.concatenate((best_indices, batch_indices))
-            keep = min(5, len(combined_scores))
-            selected = np.argpartition(combined_scores, -keep)[-keep:]
-            order = selected[np.argsort(combined_scores[selected])[::-1]]
-            best_scores = combined_scores[order]
-            best_indices = combined_indices[order]
+            local_count = min(5, len(batch_scores))
+            local_indices = np.argpartition(batch_scores, -local_count)[-local_count:]
 
-        del batch_vectors, batch_scores, batch_indices
+            for local_index in local_indices:
+                score = float(batch_scores[local_index])
+                if score < 0.05:
+                    continue
 
-    similar = pd.DataFrame()
-    if len(best_indices):
-        # Preserve the existing minimum-similarity display threshold.
-        keep_mask = best_scores >= 0.05
-        idx = best_indices[keep_mask]
-        selected_scores = best_scores[keep_mask]
-        if len(idx):
-            similar = retrieval.iloc[idx].copy()
-            if "model_text" in similar.columns:
-                similar = similar.rename(columns={"model_text": "text"})
-            similar["similarity"] = [float(score) for score in selected_scores]
+                row = batch.iloc[int(local_index)]
+                case = {
+                    "text": clean(row["model_text"]),
+                    "y": int(row["y"]),
+                    "similarity": score,
+                }
+                if "district" in batch.columns:
+                    district = row["district"]
+                    case["district"] = None if pd.isna(district) else str(district)
+                if "id" in batch.columns:
+                    case["id"] = row["id"]
+                best_cases.append(case)
+
+            best_cases.sort(key=lambda item: item["similarity"], reverse=True)
+            del best_cases[5:]
+
+        del batch, batch_text, batch_vectors, batch_scores, record_batch
+
+    similar = pd.DataFrame(best_cases)
 
     # This is a conservative UI guard, not a calibrated uncertainty estimate.
     # Do not show a binary outcome when the two class probabilities are too close.
